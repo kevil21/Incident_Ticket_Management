@@ -1,10 +1,9 @@
 """
-Index cleaned IT Asset CSV into Elastic Cloud.
+Index cleaned Incident Tickets CSV into Elastic Cloud
 
-- Input CSV: data/it_asset_inventory_cleaned.csv
-- Index name: data-operations-it-assets_elk
-- Auth: Elastic Cloud API key (provided below)
-
+- Input CSV: data/dummy_incident_tickets_cleaned.csv
+- Index name: incident-tickets-management
+- Auth: Elastic Cloud API key (via env: ES_ENDPOINT, ES_API_KEY)
 """
 
 import os
@@ -22,14 +21,13 @@ except Exception:
     raise
 
 # ---------- Config ----------
-CSV_PATH = Path("data/dummy_incident_tickets.csv")
-INDEX_NAME = "dummy_incident_tickets"
+CSV_PATH = Path("data/dummy_incident_tickets_cleaned.csv")
+INDEX_NAME = "incident-tickets-management"                
 
-# Your Elastic Cloud endpoint + API key 
-dotenv.load_dotenv()  # load from .env file if present
+# Elastic Cloud endpoint + API key
+dotenv.load_dotenv()  # load from .env file
 ES_ENDPOINT = os.getenv("ES_ENDPOINT")
 ES_API_KEY = os.getenv("ES_API_KEY")
-
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -37,16 +35,13 @@ logger = logging.getLogger("index_data")
 
 
 def get_client() -> Elasticsearch:
-    """
-    Create an Elasticsearch 8.x client for Elastic Cloud using API key auth.
-    """
     es = Elasticsearch(
         ES_ENDPOINT,
         api_key=ES_API_KEY,
         request_timeout=120,
         retry_on_timeout=True,
         max_retries=3,
-        verify_certs=True,  # Elastic Cloud has valid certs
+        verify_certs=True,
     )
     try:
         if not es.ping():
@@ -58,28 +53,27 @@ def get_client() -> Elasticsearch:
 
 def ensure_index(es: Elasticsearch, index_name: str) -> None:
     """
-    Create index with a practical mapping if it doesn't exist.
-    - Categorical fields as keyword
-    - Date normalized (YYYY-MM-DD)
-    - Room for future fields via dynamic mapping
+    Create index with defaults if it doesn't exist
+
+    -> dynamic templates to map any field ending with `_dt` as a date
+       and ignore malformed values (rows with 'Unknown' are ignored)
+    -> Everything else is mapped using dynamic mapping
     """
-    mapping = {
+    body = {
         "mappings": {
-            "properties": {
-                "hostname": {"type": "keyword"},
-                "country": {"type": "keyword"},
-                "operating_system": {"type": "keyword"},
-                "operating_system_provider": {"type": "keyword"},
-                "operating_system_lifecycle_status": {"type": "keyword"},
-                "operating_system_installation_date": {
-                    "type": "date",
-                    "format": "yyyy-MM-dd||strict_date_optional_time||epoch_millis"
-                },
-                # Fields added later by your transform step (safe to predeclare)
-                "risk_level": {"type": "keyword"},
-                "system_age_years": {"type": "integer"},
-            },
-            "dynamic": True  # accept any extra columns present in the CSV
+            "dynamic": True,
+            "dynamic_templates": [
+                {
+                    "dt_dates": {
+                        "match": "*_dt",
+                        "mapping": {
+                            "type": "date",
+                            "ignore_malformed": True,
+                            "format": "strict_date_optional_time||epoch_millis||yyyy-MM-dd"
+                        }
+                    }
+                }
+            ]
         }
     }
 
@@ -90,14 +84,15 @@ def ensure_index(es: Elasticsearch, index_name: str) -> None:
 
     if not exists:
         logger.info("Creating index '%s'...", index_name)
-        es.indices.create(index=index_name, body=mapping)
+        es.indices.create(index=index_name, body=body)
     else:
         logger.info("Index '%s' already exists; skipping creation.", index_name)
 
 
 def read_csv_rows(path: Path) -> Iterator[Dict[str, Any]]:
     """
-    Stream rows from CSV as dicts.
+    -> Stream rows from CSV as dicts (CSV to JSON conversion).
+    ->  Assumes first line is header.
     """
     with path.open(newline="", encoding="utf-8") as fh:
         reader = csv.DictReader(fh)
@@ -105,13 +100,39 @@ def read_csv_rows(path: Path) -> Iterator[Dict[str, Any]]:
             yield row
 
 
+def normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Convert 'Unknown' (any case/whitespace) to None to avoid mapping issues
+    (especially for date/numeric fields).
+    """
+    out = {}
+    for k, v in row.items():
+        if isinstance(v, str) and v.strip().lower() == "unknown":
+            out[k] = None
+        else:
+            out[k] = v
+    return out
+
+
 def actions_from_rows(rows: Iterator[Dict[str, Any]], index_name: str):
     """
-    Turn CSV rows into bulk index actions.
-    - Use 'hostname' as _id when present for idempotent upserts
+    -> Turning CSV rows into bulk index actions.
+    -> Use 'Ticket Number' (or fallback 'Hostname') as _id for records.
     """
     for row in rows:
-        doc_id = (row.get("hostname") or "").strip() or None
+        row = normalize_row(row)
+        doc_id = None
+
+        for key in ("Ticket Number", "Ticket number", "ticket_number", "ticketnumber"):
+            if key in row and (row[key] or "").strip():
+                doc_id = str(row[key]).strip()
+                break
+        if not doc_id:
+            for key in ("Hostname", "hostname"):
+                if key in row and (row[key] or "").strip():
+                    doc_id = str(row[key]).strip()
+                    break
+
         yield {
             "_op_type": "index",
             "_index": index_name,
@@ -121,6 +142,10 @@ def actions_from_rows(rows: Iterator[Dict[str, Any]], index_name: str):
 
 
 def main() -> None:
+    if not ES_ENDPOINT or not ES_API_KEY:
+        logger.error("Missing ES_ENDPOINT or ES_API_KEY environment variables.")
+        sys.exit(3)
+
     if not CSV_PATH.exists():
         logger.error("CSV not found: %s", CSV_PATH.resolve())
         sys.exit(1)
@@ -139,7 +164,7 @@ def main() -> None:
             actions,
             refresh=True,
             chunk_size=2000,
-            request_timeout=120
+            request_timeout=120,
         )
         logger.info("Bulk indexing completed. Indexed actions: %s", indexed)
     except Exception as e:
